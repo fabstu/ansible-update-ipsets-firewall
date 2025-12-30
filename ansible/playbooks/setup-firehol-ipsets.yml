@@ -1,0 +1,272 @@
+---
+# Ansible playbook to set up FireHOL ipsets with blocklists and allowlist
+# Usage: ansible-playbook -i terraform_inventory.py playbooks/setup-firehol-ipsets.yml
+
+- name: Set up FireHOL ipsets with blocklists and allowlist (DOCKER-USER rules)
+  hosts: linux_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    # Allowlist - IPs that should never be blocked (takes priority over blocklists)
+    allowlist_ips:
+      - "{{ ansible_host }}"  # The IP you're connecting from
+      # Add your IPs here:
+      # - "1.2.3.4"
+      # - "5.6.7.8/24"
+
+    # Custom denylist - (don't make the list empty)
+    denylist_ips:
+      - "1.2.3.4"
+
+    # FireHOL blocklists to enable (see https://iplists.firehol.org/)
+    # Note: Use individual lists, not composite (firehol_levelX requires component lists)
+    firehol_blocklists:
+      - spamhaus_drop       # Spamhaus DROP list - hijacked networks
+      - spamhaus_edrop      # Spamhaus EDROP list - extended DROP
+      - dshield             # DShield top attackers
+      - blocklist_de        # blocklist.de attackers
+      # - feodo              # Feodo trojan C&C servers
+      # - zeus               # Zeus trojan C&C servers
+      # - ciarmy             # CI Army malicious IPs
+
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - ipset
+          - iptables
+          - curl
+          - git
+          - unzip
+        state: present
+        update_cache: true
+
+    - name: Create FireHOL directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - /etc/firehol
+        - /etc/firehol/ipsets
+        - /usr/local/sbin
+
+    - name: Install firehol-tools (includes update-ipsets)
+      apt:
+        name: firehol-tools
+        state: present
+
+    - name: Create ipset-apply helper script
+      copy:
+        dest: /usr/local/sbin/ipset-apply.sh
+        mode: "0755"
+        owner: root
+        group: root
+        content: |
+          #!/bin/bash
+          # Apply an ipset file to the kernel
+          set -euo pipefail
+          
+          NAME="$1"
+          FILE="/etc/firehol/ipsets/${NAME}.netset"
+          [ -f "$FILE" ] || FILE="/etc/firehol/ipsets/${NAME}.ipset"
+          [ -f "$FILE" ] || { echo "No ipset/netset file found for $NAME"; exit 1; }
+          
+          # Determine set type from file
+          if grep -q "^#" "$FILE" && grep -q "hash:net" "$FILE"; then
+            TYPE="hash:net"
+          else
+            TYPE="hash:ip"
+          fi
+          
+          # Create temp set, populate, swap
+          TMPNAME="${NAME}_tmp"
+          ipset create "$TMPNAME" "$TYPE" -exist
+          ipset flush "$TMPNAME"
+          
+          # Add IPs from file (skip comments and empty lines)
+          grep -v '^#' "$FILE" | grep -v '^$' | while read -r ip; do
+            ipset add "$TMPNAME" "$ip" -exist 2>/dev/null || true
+          done
+          
+          # Create main set if not exists, then swap
+          ipset create "$NAME" "$TYPE" -exist
+          ipset swap "$TMPNAME" "$NAME"
+          ipset destroy "$TMPNAME"
+          
+          echo "Applied ipset: $NAME ($(ipset list "$NAME" | grep -c '^[0-9]' || echo 0) entries)"
+
+    - name: Create firehol-ipsets-restore script
+      copy:
+        dest: /usr/local/sbin/firehol-ipsets-restore.sh
+        mode: "0755"
+        owner: root
+        group: root
+        content: |
+          #!/bin/bash
+          # Restore FireHOL ipsets and DOCKER-USER iptables rules
+          set -euo pipefail
+          shopt -s nullglob
+          
+          cd /etc/firehol/ipsets
+          
+          # Ensure DOCKER-USER chain exists and is referenced from FORWARD
+          iptables -nL DOCKER-USER >/dev/null 2>&1 || iptables -N DOCKER-USER
+          iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -I FORWARD 1 -j DOCKER-USER
+          
+          # First: Apply allowlist with ACCEPT (must be processed BEFORE blocklists)
+          if [ -f allowlist.ipset ] || [ -f allowlist.netset ]; then
+            /usr/local/sbin/ipset-apply.sh allowlist
+            iptables -C DOCKER-USER -m set --match-set allowlist src -j ACCEPT 2>/dev/null || \
+              iptables -I DOCKER-USER 1 -m set --match-set allowlist src -j ACCEPT
+            echo "Allowlist ACCEPT rule applied (priority over blocklists)"
+          fi
+          
+          # Then: Apply blocklists with DROP (after allowlist so allowlist takes priority)
+          for f in *.ipset *.netset; do
+            [ -f "$f" ] || continue
+            name="${f%.*}"
+            [ "$name" = "allowlist" ] && continue
+            /usr/local/sbin/ipset-apply.sh "$name"
+            iptables -C DOCKER-USER -m set --match-set "$name" src -j DROP 2>/dev/null || \
+              iptables -A DOCKER-USER -m set --match-set "$name" src -j DROP
+          done
+          
+          echo "FireHOL ipsets and DOCKER-USER rules applied successfully"
+
+    - name: Create allowlist ipset file
+      copy:
+        dest: /etc/firehol/ipsets/allowlist.ipset
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          # Allowlist - IPs that should never be blocked
+          # These IPs are ALLOWED even if they appear in blocklists
+          # Add one IP or CIDR per line
+          {% for ip in allowlist_ips %}
+          {{ ip }}
+          {% endfor %}
+
+    - name: Create custom denylist ipset file
+      copy:
+        dest: /etc/firehol/ipsets/denylist.ipset
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          # Custom Denylist - manually add IPs to block
+          # These IPs are BLOCKED (unless in allowlist)
+          # Add one IP or CIDR per line
+          {% for ip in denylist_ips %}
+          {{ ip }}
+          {% endfor %}
+      register: denylist_changed
+
+    # - name: Apply denylist immediately if changed
+    #   command: /usr/local/sbin/ipset-apply.sh denylist
+    #   when: denylist_changed.changed
+
+    # - name: Add denylist DROP rule if not exists
+    #   shell: |
+    #     iptables -C DOCKER-USER -m set --match-set denylist src -j DROP 2>/dev/null || \
+    #     iptables -A DOCKER-USER -m set --match-set denylist src -j DROP
+    #   when: denylist_changed.changed
+
+    - name: Create FireHOL update-ipsets configuration
+      copy:
+        dest: /etc/firehol/update-ipsets.conf
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          # FireHOL update-ipsets configuration
+          # See: https://github.com/firehol/blocklist-ipsets
+          
+          # Enable these blocklists
+          {% for list in firehol_blocklists %}
+          ENABLE_{{ list }}=1
+          {% endfor %}
+          
+          # Store ipsets here
+          IPSETS_DIR="/etc/firehol/ipsets"
+          
+          # Run silently
+          SILENT=1
+
+    - name: Install firehol-ipsets-restore systemd service
+      ansible.builtin.template:
+        src: ../templates/firehol-ipsets-restore.service.j2
+        dest: /etc/systemd/system/firehol-ipsets-restore.service
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create update-ipsets systemd service
+      copy:
+        dest: /etc/systemd/system/update-ipsets.service
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          [Unit]
+          Description=Update FireHOL IP blocklists
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/sbin/update-ipsets
+          ExecStartPost=/bin/systemctl start firehol-ipsets-restore.service
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Create update-ipsets timer (daily updates)
+      copy:
+        dest: /etc/systemd/system/update-ipsets.timer
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          [Unit]
+          Description=Daily update of FireHOL IP blocklists
+
+          [Timer]
+          OnCalendar=daily
+          RandomizedDelaySec=3600
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable firehol-ipsets-restore at boot
+      ansible.builtin.systemd:
+        name: firehol-ipsets-restore.service
+        enabled: true
+
+    - name: Enable update-ipsets timer
+      ansible.builtin.systemd:
+        name: update-ipsets.timer
+        enabled: true
+        state: started
+
+    - name: Display setup info
+      debug:
+        msg: |
+          FireHOL ipsets setup complete!
+          
+          - Allowlist IPs: {{ allowlist_ips | join(', ') }}
+          - Enabled blocklists: {{ firehol_blocklists | join(', ') }}
+          
+          To download blocklists now, run:
+            systemctl start update-ipsets.service
+          
+          Blocklists will auto-update daily via the timer.

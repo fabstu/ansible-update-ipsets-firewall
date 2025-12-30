@@ -1,0 +1,63 @@
+---
+# Ansible playbook to set up UFW firewall on Ubuntu
+# Usage: ansible-playbook -i terraform_inventory.py playbooks/setup-ufw.yml
+
+- name: Set up UFW firewall
+  hosts: linux_servers
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Install UFW
+      apt:
+        name: ufw
+        state: present
+        update_cache: true
+
+    - name: Reset UFW to default settings
+      community.general.ufw:
+        state: reset
+
+    - name: Set default policy - deny incoming
+      community.general.ufw:
+        direction: incoming
+        policy: deny
+
+    - name: Set default policy - allow outgoing
+      community.general.ufw:
+        direction: outgoing
+        policy: allow
+
+    - name: Allow SSH (port 22)
+      community.general.ufw:
+        rule: allow
+        port: '22'
+        proto: tcp
+        comment: 'Allow SSH'
+
+    - name: Allow HTTP (port 80)
+      community.general.ufw:
+        rule: allow
+        port: '80'
+        proto: tcp
+        comment: 'Allow HTTP'
+
+    - name: Allow port 8080 (echo server)
+      community.general.ufw:
+        rule: allow
+        port: '8080'
+        proto: tcp
+        comment: 'Allow echo server'
+
+    - name: Enable UFW
+      community.general.ufw:
+        state: enabled
+
+    - name: Get UFW status
+      command: ufw status verbose
+      register: ufw_status
+      changed_when: false
+
+    - name: Display UFW status
+      debug:
+        msg: "{{ ufw_status.stdout_lines }}"

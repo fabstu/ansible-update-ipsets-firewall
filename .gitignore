@@ -32,3 +32,10 @@ override.tf.json
 
 # Sensitive plan output
 *.tfplan
+
+# Ansible files
+*.retry
+ansible/.cache/
+ansible/tmp/
+__pycache__/
+*.pyc
