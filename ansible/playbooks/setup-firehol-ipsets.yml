@@ -10,7 +10,8 @@
   vars:
     # Allowlist - IPs that should never be blocked (takes priority over blocklists)
     allowlist_ips:
-      - "{{ ansible_host }}"  # The IP you're connecting from
+      - "1.2.3.5"
+      # - "{{ ansible_host }}"  # The IP you're connecting from
       # Add your IPs here:
       # - "1.2.3.4"
       # - "5.6.7.8/24"

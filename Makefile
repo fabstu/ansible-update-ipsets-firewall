@@ -1,4 +1,4 @@
-.PHONY: init plan apply destroy ssh output ansible-ping ansible-docker ansible-ufw ansible-firehol ansible-test echo-server http-server firewall-status firewall-update firewall-test
+.PHONY: init plan apply destroy ssh output ansible-ping ansible-docker ansible-ufw ansible-firehol ansible-test echo-server http-server firewall-status firewall-update firewall-disable firewall-enable firewall-test
 
 # Variables
 SSH_CMD = ssh $(1) -i ~/.ssh/digitalocean-terraform -o IdentitiesOnly=yes root@$$(terraform output -raw droplet_ip)
@@ -77,6 +77,46 @@ firewall-update:
 	@$(call SSH_CMD) \
 		'systemctl is-failed update-ipsets.service firehol-ipsets-restore.service --quiet && echo "ERROR: One or more services failed!" && exit 1 || echo "All services completed successfully."'
 
+firewall-disable:
+	@echo "Disabling firewall blocklists..."
+	@echo ""
+	@echo "1. Stopping update timer..."
+	@$(call SSH_CMD) \
+		'systemctl stop update-ipsets.timer 2>/dev/null || true; systemctl disable update-ipsets.timer 2>/dev/null || true'
+	@echo "   ✓ Timer stopped"
+	@echo ""
+	@echo "2. Disabling restore service at boot..."
+	@$(call SSH_CMD) \
+		'systemctl disable firehol-ipsets-restore.service 2>/dev/null || true'
+	@echo "   ✓ Service disabled"
+	@echo ""
+	@echo "3. Flushing DOCKER-USER iptables rules..."
+	@$(call SSH_CMD) \
+		'iptables -F DOCKER-USER 2>/dev/null || true; iptables -A DOCKER-USER -j RETURN 2>/dev/null || true'
+	@echo "   ✓ DOCKER-USER chain flushed"
+	@echo ""
+	@echo "4. Destroying ipsets..."
+	@$(call SSH_CMD) \
+		'ipset list -n 2>/dev/null | while read name; do ipset destroy "$$name" 2>/dev/null || true; done'
+	@echo "   ✓ Ipsets destroyed"
+	@echo ""
+	@echo "Blocklists disabled. Run 'make firewall-enable' to re-enable."
+
+firewall-enable:
+	@echo "Enabling firewall blocklists..."
+	@echo ""
+	@echo "1. Enabling restore service at boot..."
+	@$(call SSH_CMD) \
+		'systemctl enable firehol-ipsets-restore.service'
+	@echo "   ✓ Service enabled"
+	@echo ""
+	@echo "2. Enabling and starting update timer..."
+	@$(call SSH_CMD) \
+		'systemctl enable update-ipsets.timer && systemctl start update-ipsets.timer'
+	@echo "   ✓ Timer enabled and started"
+	@echo ""
+	@echo "3. Running update and restore..."
+	@$(MAKE) firewall-update
 
 firewall-test:
 	@echo "Testing firewall by temporarily adding your IP to a test blocklist..."
